@@ -2,10 +2,19 @@
 """Convolution modules."""
 
 import math
+from typing import Union, Optional
 
 import numpy as np
 import torch
 import torch.nn as nn
+
+
+from abc import ABCMeta
+from abc import abstractmethod
+
+import brevitas.nn as qnn
+import functorch
+
 
 __all__ = (
     "Conv",
@@ -14,6 +23,7 @@ __all__ = (
     "DWConv",
     "DWConvTranspose2d",
     "ConvTranspose",
+    "QuantConvTranspose",
     "Focus",
     "GhostConv",
     "ChannelAttention",
@@ -21,7 +31,42 @@ __all__ = (
     "CBAM",
     "Concat",
     "RepConv",
+    "QuantConv",
+    "QuantConcat",
+    "QuantUpsamplingNearest2d",
+    "QuantUnpackTensors",
+    "Uint8ActPerTensorPoT",
+    "Int8ActPerTensorPoT",
+    "Int8WeightPerChannelPoT",
+
 )
+
+from brevitas import config
+from brevitas.core.function_wrapper import CeilSte
+from brevitas.inject.enum import RestrictValueType
+
+from brevitas.quant_tensor import QuantTensor, _unpack_quant_tensor
+
+from torch import Tensor
+
+from torch.nn import UpsamplingNearest2d
+from torch.nn.functional import interpolate
+
+import brevitas.quant as quant
+
+
+
+class Uint8ActPerTensorPoT(quant.Uint8ActPerTensorFloat):
+    restrict_scaling_type = RestrictValueType.POWER_OF_TWO
+    restrict_value_float_to_int_impl = CeilSte
+
+class Int8ActPerTensorPoT(quant.Int8ActPerTensorFloat):
+    restrict_scaling_type = RestrictValueType.POWER_OF_TWO
+    restrict_value_float_to_int_impl = CeilSte
+
+class Int8WeightPerChannelPoT(quant.Int8WeightPerChannelFloat):
+    restrict_scaling_type = RestrictValueType.POWER_OF_TWO
+    restrict_value_float_to_int_impl = CeilSte
 
 
 def autopad(k, p=None, d=1):  # kernel, padding, dilation
@@ -74,10 +119,62 @@ class Conv2(Conv):
         """Fuse parallel convolutions."""
         w = torch.zeros_like(self.conv.weight.data)
         i = [x // 2 for x in w.shape[2:]]
-        w[:, :, i[0] : i[0] + 1, i[1] : i[1] + 1] = self.cv2.weight.data.clone()
+        w[:, :, i[0]: i[0] + 1, i[1]: i[1] + 1] = self.cv2.weight.data.clone()
         self.conv.weight.data += w
         self.__delattr__("cv2")
         self.forward = self.forward_fuse
+
+
+class QuantUnpackTensors(torch.nn.Module):
+    def __init__(self,*args,**kwargs) -> None:
+        super().__init__()
+
+    def forward(self, x):
+        x = _unpack_quant_tensor(x)
+        # print(x[0][0,:,0,0])
+        return x
+
+class QuantConv(nn.Module):
+
+    """Simplified RepConv module with Conv fusing."""
+    default_act = qnn.QuantReLU(act_quant=Uint8ActPerTensorPoT,bit_width= 6,return_quant_tensor=True)  # default activation
+
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True ,weight_quant=None,act_quant=None,**kwargs):
+        """Initialize Conv layer with given arguments including activation."""
+        super().__init__()
+        self.bit_width = kwargs.get('bit_width', 6)
+        self.act_quant = act_quant
+
+        self.weight_quant = weight_quant
+        self.weight_bit_width = kwargs.get('weight_bit_width', 6)
+        self.return_quant_tensor = kwargs.get('return_quant_tensor', True)
+
+        self.conv = qnn.QuantConv2d(c1, c2, k, s, autopad(k, p, d), groups=g, dilation=d, bias=False,weight_quant=self.weight_quant,weight_bit_width=self.weight_bit_width,return_quant_tensor=self.return_quant_tensor)
+        self.bn = nn.BatchNorm2d(c2)
+        default_act = qnn.QuantReLU(act_quant=self.act_quant,bit_width=self.bit_width,return_quant_tensor=self.return_quant_tensor)  # default activation
+        self.act = default_act if act is True else act if isinstance(act, nn.Module) else qnn.QuantIdentity(return_quant_tensor=self.return_quant_tensor,act_quant=self.act_quant,bit_width=self.bit_width)
+
+
+    def forward(self, x):
+        """Apply convolution, batch normalization and activation to input tensor."""
+
+        return self.act(self.bn(self.conv(x)))
+
+    def toggle_quantize(self, quantize):
+        if quantize:
+            self.conv.weight_quant = self.weight_quant
+            self.conv.weight_bit_width = self.weight_bit_width
+
+            self.act.act_quant = self.act_quant
+            self.act.bit_width = self.bit_width
+
+
+
+
+
+    def forward_fuse(self, x):
+        """Perform transposed convolution of 2D data."""
+        return self.act(self.conv(x))
 
 
 class LightConv(nn.Module):
@@ -134,6 +231,27 @@ class ConvTranspose(nn.Module):
         """Applies activation and convolution transpose operation to input."""
         return self.act(self.conv_transpose(x))
 
+class QuantConvTranspose(nn.Module):
+    """Convolution transpose 2d layer."""
+
+    default_act = qnn.QuantReLU(act_quant=Uint8ActPerTensorPoT,bit_width= 6,return_quant_tensor=True)  # default activation
+
+
+    def __init__(self, c1, c2, k=2, s=2, p=0, bn=True, act=True):
+        """Initialize ConvTranspose2d layer with batch normalization and activation function."""
+        super().__init__()
+        self.conv_transpose = qnn.QuantConvTranspose2d(c1, c2, k, s, p, bias=not bn,weight_quant=Int8WeightPerChannelPoT,weight_bit_width= 6,return_quant_tensor=True)
+        self.bn = nn.BatchNorm2d(c2) if bn else qnn.QuantIdentity(act_quant=Int8ActPerTensorPoT,bit_width= 6,return_quant_tensor=True)
+        self.act = self.default_act if act is True else act if isinstance(act, nn.Module) else qnn.QuantIdentity(act_quant=Int8ActPerTensorPoT,bit_width= 6,return_quant_tensor=True)
+
+    def forward(self, x):
+        """Applies transposed convolutions, batch normalization and activation to input."""
+        return self.act(self.bn(self.conv_transpose(x)))
+
+    def forward_fuse(self, x):
+        """Applies activation and convolution transpose operation to input."""
+        return self.act(self.conv_transpose(x))
+
 
 class Focus(nn.Module):
     """Focus wh information into c-space."""
@@ -158,7 +276,9 @@ class GhostConv(nn.Module):
     """Ghost Convolution https://github.com/huawei-noah/ghostnet."""
 
     def __init__(self, c1, c2, k=1, s=1, g=1, act=True):
-        """Initializes Ghost Convolution module with primary and cheap operations for efficient feature learning."""
+        """Initializes the GhostConv object with input channels, output channels, kernel size, stride, groups and
+        activation.
+        """
         super().__init__()
         c_ = c2 // 2  # hidden channels
         self.cv1 = Conv(c1, c_, k, s, None, g, act=act)
@@ -209,8 +329,7 @@ class RepConv(nn.Module):
         kernelid, biasid = self._fuse_bn_tensor(self.bn)
         return kernel3x3 + self._pad_1x1_to_3x3_tensor(kernel1x1) + kernelid, bias3x3 + bias1x1 + biasid
 
-    @staticmethod
-    def _pad_1x1_to_3x3_tensor(kernel1x1):
+    def _pad_1x1_to_3x3_tensor(self, kernel1x1):
         """Pads a 1x1 tensor to a 3x3 tensor."""
         if kernel1x1 is None:
             return 0
@@ -330,3 +449,228 @@ class Concat(nn.Module):
     def forward(self, x):
         """Forward pass for the YOLOv8 mask Proto module."""
         return torch.cat(x, self.d)
+
+
+class QuantConcat(nn.Module):
+
+    """Concatenate a list of tensors along dimension."""
+
+    def __init__(self, dimension=1):
+        """Concatenates a list of tensors along a specified dimension."""
+        super().__init__()
+        self.d = dimension
+
+    def toggle_quantize(self, quantize):
+        pass
+
+    def forward(self, x):
+        """Forward pass for the YOLOv8 mask Proto module."""
+        return torch.cat(x, self.d)
+
+
+
+class ExportMixin(object):
+    __metaclass__ = ABCMeta
+
+    def __init__(self):
+        self._export_mode = False
+        self.export_debug_name = None
+        self.export_handler = None
+        self.export_input_debug = False
+        self.export_output_debug = False
+
+    @property
+    @abstractmethod
+    def requires_export_handler(self):
+        pass
+
+    @property
+    def export_mode(self):
+        return self._export_mode
+
+    @export_mode.setter
+    def export_mode(self, value):
+        if value and config.JIT_ENABLED:
+            raise RuntimeError(
+                "Export mode with BREVITAS_JIT is currently not supported. Save the model' "
+                "state_dict to a .pth, load it back with BREVITAS_JIT=0, and call export.")
+        if value and self.training:
+            raise RuntimeError("Can't enter export mode during training, only during inference")
+        if value and self.requires_export_handler and self.export_handler is None:
+            raise RuntimeError("Can't enable export mode on a layer without an export handler")
+        elif value and not self.requires_export_handler and self.export_handler is None:
+            return  # don't set export mode when it's not required and there is no handler
+        elif value and not self._export_mode and self.export_handler is not None:
+            self.export_handler.prepare_for_export(self)
+            self.export_handler.attach_debug_info(self)
+        elif not value and self.export_handler is not None:
+            self.export_handler = None
+        self._export_mode = value
+
+
+class _CachedIO:
+
+    def __init__(self, quant_tensor: QuantTensor, metadata_only: bool):
+        self.shape = quant_tensor.value.shape
+        if metadata_only:
+            self.quant_tensor = quant_tensor.set(value=None)
+        else:
+            self.quant_tensor = quant_tensor
+
+    @property
+    def scale(self):
+        return self.quant_tensor.scale
+
+    @property
+    def zero_point(self):
+        return self.quant_tensor.zero_point
+
+    @property
+    def bit_width(self):
+        return self.quant_tensor.bit_width
+
+    @property
+    def signed(self):
+        return self.quant_tensor.signed
+
+
+class QuantLayerMixin(ExportMixin):
+    __metaclass__ = ABCMeta
+
+    def __init__(
+            self,
+            return_quant_tensor: bool,
+            cache_inference_quant_inp: bool = False,
+            cache_inference_quant_out: bool = False,
+            cache_quant_io_metadata_only: bool = True):
+        ExportMixin.__init__(self)
+        self.accept_quant_tensor = True
+        self.return_quant_tensor = return_quant_tensor
+        self.cache_inference_quant_inp = cache_inference_quant_inp
+        self.cache_inference_quant_out = cache_inference_quant_out
+        self.cache_quant_io_metadata_only = cache_quant_io_metadata_only
+        self._cached_inp = None
+        self._cached_out = None
+
+    @property
+    @abstractmethod
+    def channelwise_separable(self) -> bool:
+        pass
+
+    @property
+    def is_quant_input_signed(self) -> Optional[bool]:  # tri-valued logic output
+        if self._cached_inp is not None:
+            return self._cached_inp.signed
+        else:
+            return None
+
+    def _set_global_is_quant_layer(self, value):
+        config._IS_INSIDE_QUANT_LAYER = value
+
+    def quant_input_scale(self):
+        if self._cached_inp is not None:
+            return self._cached_inp.scale
+        else:
+            return None
+
+    def quant_input_zero_point(self):
+        if self._cached_inp is not None:
+            return self._cached_inp.zero_point
+        else:
+            return None
+
+    def quant_input_bit_width(self):
+        if self._cached_inp is not None:
+            return self._cached_inp.bit_width
+        else:
+            return None
+
+    @property
+    def is_quant_output_signed(self) -> Optional[bool]:  # tri-valued logic output
+        if self._cached_out is not None:
+            return self._cached_out.signed
+        else:
+            return None
+
+    def quant_output_scale(self):
+        if self._cached_out is not None:
+            return self._cached_out.scale
+        else:
+            return None
+
+    def quant_output_zero_point(self):
+        if self._cached_out is not None:
+            return self._cached_out.zero_point
+        else:
+            return None
+
+    def quant_output_bit_width(self):
+        if self._cached_out is not None:
+            return self._cached_out.bit_width
+        else:
+            return None
+
+    def unpack_input(self, inp: Union[Tensor, QuantTensor]):
+        self._set_global_is_quant_layer(True)
+        # Hack to recognize a QuantTensor that has decayed to a tuple
+        # when used as input to tracing (e.g. during ONNX export)
+        if (torch._C._get_tracing_state() is not None and isinstance(inp, tuple) and
+                len(inp) == len(QuantTensor._fields) and all([isinstance(t, Tensor) for t in inp])):
+            inp = QuantTensor(*inp)
+        if isinstance(inp, QuantTensor):
+            # don't cache values during export pass
+            if not self.training and not self._export_mode and self.cache_inference_quant_inp:
+                cached_inp = _CachedIO(inp.detach(), self.cache_quant_io_metadata_only)
+                self._cached_inp = cached_inp
+        else:
+            inp = QuantTensor(inp, training=self.training)
+            if not self.training and self.cache_inference_quant_inp:
+                cached_inp = _CachedIO(inp.detach(), self.cache_quant_io_metadata_only)
+                self._cached_inp = cached_inp
+        # Remove any naming metadata to avoid dowmstream errors
+        # Avoid inplace operations on the input in case of forward hooks
+        if not torch._C._get_tracing_state():
+            inp = inp.set(value=inp.value.rename(None))
+        return inp
+
+    def pack_output(self, quant_output: QuantTensor):
+        if not self.training and self.cache_inference_quant_out:
+            self._cached_out = _CachedIO(quant_output.detach(), self.cache_quant_io_metadata_only)
+        self._set_global_is_quant_layer(False)
+        if self.return_quant_tensor:
+            return quant_output
+        else:
+            return quant_output.value
+
+
+class QuantUpsamplingNearest2d(QuantLayerMixin, UpsamplingNearest2d):
+
+    def __init__(self, size=None, scale_factor=None, return_quant_tensor: bool = True, **kwargs):
+        UpsamplingNearest2d.__init__(self, size=size, scale_factor=scale_factor)
+        QuantLayerMixin.__init__(self, return_quant_tensor)
+
+    @property
+    def channelwise_separable(self) -> bool:
+        return True
+
+    @property
+    def requires_export_handler(self):
+        return False
+
+    def toggle_quantize(self, quantize):
+        pass
+
+    def forward(self, input: Union[Tensor, QuantTensor]):
+        x = self.unpack_input(input)
+        if self.export_mode:
+            out = self.export_handler(x.value)
+            self._set_global_is_quant_layer(False)
+            return out
+        y_value = interpolate(x.value, self.size, self.scale_factor, self.mode, self.align_corners)
+        y = x.set(value=y_value)
+        return self.pack_output(y)
+
+# class QuantUpsamplingNearest2d():
+#     pass
+
+

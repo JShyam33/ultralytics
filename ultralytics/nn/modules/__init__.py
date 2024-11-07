@@ -11,16 +11,15 @@ Example:
 
     x = torch.ones(1, 128, 40, 40)
     m = Conv(128, 128)
-    f = f"{m._get_name()}.onnx"
+    f = f'{m._get_name()}.onnx'
     torch.onnx.export(m, x, f)
-    os.system(f"onnxslim {f} {f} && open {f}")  # pip install onnxslim
+    os.system(f'onnxslim {f} {f} && open {f}')  # pip install onnxslim
     ```
 """
 
 from .block import (
     C1,
     C2,
-    C2PSA,
     C3,
     C3TR,
     CIB,
@@ -39,9 +38,7 @@ from .block import (
     C2f,
     C2fAttn,
     C2fCIB,
-    C2fPSA,
     C3Ghost,
-    C3k2,
     C3x,
     CBFuse,
     CBLinear,
@@ -56,6 +53,7 @@ from .block import (
     RepVGGDW,
     ResNetLayer,
     SCDown,
+    QuantSPPF
 )
 from .conv import (
     CBAM,
@@ -64,15 +62,17 @@ from .conv import (
     Conv,
     Conv2,
     ConvTranspose,
+    QuantConvTranspose,
     DWConv,
     DWConvTranspose2d,
     Focus,
     GhostConv,
     LightConv,
     RepConv,
-    SpatialAttention,
+    SpatialAttention, QuantConv, QuantConcat, QuantUpsamplingNearest2d, QuantUnpackTensors,Uint8ActPerTensorPoT,Int8ActPerTensorPoT,Int8WeightPerChannelPoT
 )
-from .head import OBB, Classify, Detect, Pose, RTDETRDecoder, Segment, WorldDetect, v10Detect
+from .head import OBB, Classify, Detect, Pose, RTDETRDecoder, Segment, WorldDetect, v10Detect, QuantDetect, \
+    PostQuantDetect, NewQuantDetect
 from .transformer import (
     AIFI,
     MLP,
@@ -89,11 +89,16 @@ from .transformer import (
 __all__ = (
     "Conv",
     "Conv2",
+    "QuantConv",
+    "QuantUpsamplingNearest2d",
+    "QuantConcat",
+    "QuantSPPF",
     "LightConv",
     "RepConv",
     "DWConv",
     "DWConvTranspose2d",
     "ConvTranspose",
+    "QuantConvTranspose",
     "Focus",
     "GhostConv",
     "ChannelAttention",
@@ -113,10 +118,6 @@ __all__ = (
     "C2",
     "C3",
     "C2f",
-    "C3k2",
-    "SCDown",
-    "C2fPSA",
-    "C2PSA",
     "C2fAttn",
     "C3x",
     "C3TR",
@@ -126,6 +127,7 @@ __all__ = (
     "BottleneckCSP",
     "Proto",
     "Detect",
+    "QuantDetect",
     "Segment",
     "Pose",
     "Classify",
@@ -156,4 +158,12 @@ __all__ = (
     "C2fCIB",
     "Attention",
     "PSA",
+    "SCDown",
+    "QuantUnpackTensors",
+    "PostQuantDetect",
+    "NewQuantDetect",
+    "Uint8ActPerTensorPoT",
+    "Int8ActPerTensorPoT",
+    "Int8WeightPerChannelPoT",
+
 )
