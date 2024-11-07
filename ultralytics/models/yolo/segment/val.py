@@ -22,7 +22,7 @@ class SegmentationValidator(DetectionValidator):
         ```python
         from ultralytics.models.yolo.segment import SegmentationValidator
 
-        args = dict(model="yolov8n-seg.pt", data="coco8-seg.yaml")
+        args = dict(model='yolov8n-seg.pt', data='coco8-seg.yaml')
         validator = SegmentationValidator(args=args)
         validator()
         ```
@@ -48,8 +48,9 @@ class SegmentationValidator(DetectionValidator):
         self.plot_masks = []
         if self.args.save_json:
             check_requirements("pycocotools>=2.0.6")
-        # more accurate vs faster
-        self.process = ops.process_mask_native if self.args.save_json or self.args.save_txt else ops.process_mask
+            self.process = ops.process_mask_upsample  # more accurate
+        else:
+            self.process = ops.process_mask  # faster
         self.stats = dict(tp_m=[], tp=[], conf=[], pred_cls=[], target_cls=[], target_img=[])
 
     def get_desc(self):
@@ -76,7 +77,7 @@ class SegmentationValidator(DetectionValidator):
             self.args.iou,
             labels=self.lb,
             multi_label=True,
-            agnostic=self.args.single_cls or self.args.agnostic_nms,
+            agnostic=self.args.single_cls,
             max_det=self.args.max_det,
             nc=self.nc,
         )
@@ -147,23 +148,14 @@ class SegmentationValidator(DetectionValidator):
 
             # Save
             if self.args.save_json:
-                self.pred_to_json(
-                    predn,
-                    batch["im_file"][si],
-                    ops.scale_image(
-                        pred_masks.permute(1, 2, 0).contiguous().cpu().numpy(),
-                        pbatch["ori_shape"],
-                        ratio_pad=batch["ratio_pad"][si],
-                    ),
-                )
-            if self.args.save_txt:
-                self.save_one_txt(
-                    predn,
-                    pred_masks,
-                    self.args.save_conf,
+                pred_masks = ops.scale_image(
+                    pred_masks.permute(1, 2, 0).contiguous().cpu().numpy(),
                     pbatch["ori_shape"],
-                    self.save_dir / "labels" / f'{Path(batch["im_file"][si]).stem}.txt',
+                    ratio_pad=batch["ratio_pad"][si],
                 )
+                self.pred_to_json(predn, batch["im_file"][si], pred_masks)
+            # if self.args.save_txt:
+            #    save_one_txt(predn, save_conf, shape, file=save_dir / 'labels' / f'{path.stem}.txt')
 
     def finalize_metrics(self, *args, **kwargs):
         """Sets speed and confusion matrix for evaluation metrics."""
@@ -242,18 +234,6 @@ class SegmentationValidator(DetectionValidator):
             on_plot=self.on_plot,
         )  # pred
         self.plot_masks.clear()
-
-    def save_one_txt(self, predn, pred_masks, save_conf, shape, file):
-        """Save YOLO detections to a txt file in normalized coordinates in a specific format."""
-        from ultralytics.engine.results import Results
-
-        Results(
-            np.zeros((shape[0], shape[1]), dtype=np.uint8),
-            path=None,
-            names=self.names,
-            boxes=predn[:, :6],
-            masks=pred_masks,
-        ).save_txt(file, save_conf=save_conf)
 
     def pred_to_json(self, predn, filename, pred_masks):
         """
